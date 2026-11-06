@@ -61,6 +61,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import zlib
 from datetime import date, datetime, timedelta, timezone
@@ -1149,6 +1150,44 @@ _CAPTURE_ANCHOR = ("<style>body{align-items:flex-start;justify-content:flex-star
 _RENDER_SECONDS = 20
 
 
+def _png_done(path):
+    """True once the file is a whole PNG: it ends with the IEND chunk."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(8) != b"\x89PNG\r\n\x1a\n":
+                return False
+            f.seek(-12, os.SEEK_END)
+            return f.read(12) == b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    except OSError:
+        return False
+
+
+def _screenshot(cmd, out_abs):
+    """Runs the browser until it exits or its screenshot is whole, and gives its exit code, or None past the limit.
+    Chrome 145 on macOS writes the screenshot and then keeps running, so a whole PNG counts as done and the browser
+    is stopped."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + _RENDER_SECONDS
+        while True:
+            code = proc.poll()
+            if code is not None:
+                return code
+            if _png_done(out_abs):
+                return 0
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.1)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
 def render_png(html, out_path, fmt="square"):
     """Rasterize the card HTML to a PNG via headless chrome at 2x, cropped to
     the exact card size. Returns (ok, message). Falls back with ok=False
@@ -1168,13 +1207,14 @@ def render_png(html, out_path, fmt="square"):
                "--force-device-scale-factor=2", "--user-data-dir=" + os.path.join(tmp, "profile"),
                "--window-size=%d,%d" % (w, h + _CAPTURE_HEADROOM),
                "--screenshot=" + out_abs, "file://" + html_path]
-        try:
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                  timeout=_RENDER_SECONDS)
-        except subprocess.TimeoutExpired:
+        # an older card under the same name would read as this one being done.
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(out_abs)
+        code = _screenshot(cmd, out_abs)
+        if code is None:
             return False, "the browser took more than %d seconds" % _RENDER_SECONDS
-        if proc.returncode != 0 or not os.path.exists(out_abs):
-            return False, "the browser did not produce an image (exit %d)" % proc.returncode
+        if not _png_done(out_abs):
+            return False, "the browser did not produce an image (exit %d)" % code
         ok, msg = _crop_png(out_abs, w * 2, h * 2)
         if not ok:
             return False, "rendered, but could not crop to the card box: %s" % msg

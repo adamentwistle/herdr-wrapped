@@ -32,7 +32,7 @@ import habits  # noqa: E402
 import sample  # noqa: E402
 import wrapped  # noqa: E402
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 READ_BUDGET = 15.0
 SAVE_BUDGET = 4.0
 MAX_FILE = 256 * 1024 * 1024
@@ -251,14 +251,16 @@ def collect(roots, cache_path, budget):
     found = transcripts(roots)
     files, runs, parsed, waiting, left_out, parents = {}, [], 0, 0, 0, {}
     for path, size, mtime in found:
-        entry = known.get(path)
+        # A transcript's path holds its project's folder name, so the cache is keyed by a hash of it instead.
+        key = hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()
+        entry = known.get(key)
         if not entry or entry.get("size") != size or entry.get("mtime") != mtime:
             if parsed and time.monotonic() - began >= budget:
                 waiting += 1
                 continue
             entry = read_one(path, size, mtime, parents)
             parsed += 1
-        files[path] = entry
+        files[key] = entry
         if entry.get("bad"):
             left_out += 1
         elif entry.get("run"):
