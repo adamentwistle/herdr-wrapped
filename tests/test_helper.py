@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Checks for helper.py and the mod's changes to wrapped.py, on hand-made runs and the bundled fixtures only.
+
+  python tests/test_helper.py
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+sys.dont_write_bytecode = True
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MOD = os.path.join(ROOT, "mods", "wrapped")
+sys.path.insert(0, MOD)
+import helper  # noqa: E402
+import wrapped  # noqa: E402
+
+
+def run(run_id, started, ended):
+    return {"run_id": run_id, "started": started, "ended": ended}
+
+
+def at(clock):
+    return "2026-07-01T%s:00+00:00" % clock
+
+
+def peak(*runs):
+    return helper.peak_agents(list(runs))["count"]
+
+
+class Peak(unittest.TestCase):
+    def test_apart(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("10:00")), run("b", at("11:00"), at("12:00"))), 1)
+
+    def test_touching_sessions_do_not_overlap(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("10:00")), run("b", at("10:00"), at("11:00"))), 1)
+
+    def test_a_chain_of_touching_sessions_stays_at_one(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("10:00")), run("b", at("10:00"), at("11:00")),
+                              run("c", at("11:00"), at("12:00"))), 1)
+
+    def test_overlapping(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("10:01")), run("b", at("10:00"), at("11:00"))), 2)
+
+    def test_nested(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("12:00")), run("b", at("10:00"), at("11:00")),
+                              run("c", at("10:30"), at("10:45"))), 3)
+
+    def test_staggered_pairs_never_reach_three(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("10:00")), run("b", at("09:30"), at("10:30")),
+                              run("c", at("10:15"), at("11:00"))), 2)
+
+    def test_same_start_and_end(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("10:00")), run("b", at("09:00"), at("10:00"))), 2)
+
+    def test_one_timestamp_alone(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("09:00"))), 1)
+
+    def test_one_timestamp_inside_a_session(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("10:00")), run("b", at("09:30"), at("09:30"))), 2)
+
+    def test_one_timestamp_touching_a_session_end(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("10:00")), run("b", at("10:00"), at("10:00"))), 1)
+
+    def test_a_subagent_folds_into_its_session(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("10:00")), run("a", at("09:10"), at("09:20")),
+                              run("a", at("09:15"), at("09:25"))), 1)
+
+    def test_a_subagent_past_its_session_extends_it(self):
+        self.assertEqual(peak(run("a", at("09:00"), at("10:00")), run("a", at("09:50"), at("11:00")),
+                              run("b", at("10:30"), at("10:40"))), 2)
+
+    def test_different_offsets_compare_as_moments(self):
+        self.assertEqual(peak(run("a", "2026-07-01T09:00:00+00:00", "2026-07-01T10:00:00+00:00"),
+                              run("b", "2026-07-01T10:30:00+01:00", "2026-07-01T11:30:00+01:00")), 2)
+
+    def test_no_times(self):
+        self.assertIsNone(helper.peak_agents([run("a", None, None)]))
+        self.assertIsNone(helper.peak_agents([]))
+
+    def test_says_when(self):
+        got = helper.peak_agents([run("a", "2026-07-02T09:00:00+00:00", "2026-07-02T10:00:00+00:00"),
+                                  run("b", "2026-07-02T09:30:00+00:00", "2026-07-02T09:40:00+00:00")])
+        self.assertEqual(got, {"count": 2, "date": "2026-07-02", "label": "jul 2"})
+
+
+def assistant(uuid, session, stamp, cwd="/work/secret-project"):
+    return json.dumps({"type": "assistant", "uuid": uuid, "requestId": "r" + uuid, "sessionId": session, "timestamp": stamp,
+                       "cwd": cwd, "message": {"model": "claude-opus-4-8", "usage": {"input_tokens": 100, "output_tokens": 50},
+                                               "content": [{"type": "tool_use", "id": "t" + uuid, "name": "Bash"}]}})
+
+
+class Folder(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.projects = os.path.join(self.dir, "projects")
+        self.cache = os.path.join(self.dir, "data", "wrapped", "runs-cache.json")
+
+    def write(self, name, session, start, end, root=None):
+        path = os.path.join(root or self.projects, "proj", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(assistant(name + "1", session, start) + "\n" + assistant(name + "2", session, end) + "\n")
+        return path
+
+    def args(self, budget=15.0, **more):
+        values = {"demo": False, "projects": [self.projects], "cache": self.cache, "budget": budget, "window": "all", "out": None}
+        return mock.Mock(**{**values, **more})
+
+    def three(self):
+        self.write("a.jsonl", "a", "2026-07-01T09:00:00Z", "2026-07-01T10:00:00Z")
+        self.write("b.jsonl", "b", "2026-07-01T09:30:00Z", "2026-07-01T09:40:00Z")
+        self.write("c.jsonl", "c", "2026-07-02T09:30:00Z", "2026-07-02T09:40:00Z")
+
+    def test_second_read_parses_nothing(self):
+        self.three()
+        first = helper.read(self.args())
+        with mock.patch.object(helper.wrapped, "parse_run", side_effect=AssertionError("parsed again")):
+            second = helper.read(self.args())
+        self.assertEqual(first, second)
+        self.assertEqual(second["windows"]["all"]["sessions"], "3")
+
+    def test_a_changed_file_is_parsed_again_and_only_it(self):
+        self.three()
+        helper.read(self.args())
+        self.write("b.jsonl", "b", "2026-07-01T09:30:00Z", "2026-07-01T11:00:00Z")
+        real, seen = wrapped.parse_run, []
+        with mock.patch.object(helper.wrapped, "parse_run", side_effect=lambda p, *rest: seen.append(p) or real(p, *rest)):
+            helper.read(self.args())
+        self.assertEqual([os.path.basename(p) for p in seen], ["b.jsonl"])
+
+    def test_a_deleted_file_leaves_the_cache(self):
+        self.three()
+        helper.read(self.args())
+        os.remove(os.path.join(self.projects, "proj", "c.jsonl"))
+        self.assertEqual(helper.read(self.args())["windows"]["all"]["sessions"], "2")
+
+    def test_a_new_wrapped_py_starts_again(self):
+        self.three()
+        helper.read(self.args())
+        real, seen = wrapped.parse_run, []
+        with mock.patch.object(helper, "parser_id", return_value="other"), \
+                mock.patch.object(helper.wrapped, "parse_run", side_effect=lambda p, *rest: seen.append(p) or real(p, *rest)):
+            helper.read(self.args())
+        self.assertEqual(len(seen), 3)
+
+    def test_a_spent_budget_goes_in_passes_and_ends_the_same(self):
+        self.three()
+        whole = helper.read(self.args(cache=os.path.join(self.dir, "other.json")))
+        progress = []
+        for _ in range(5):
+            reply = helper.read(self.args(budget=0))
+            progress.append(reply["read"])
+            if not reply["partial"]:
+                break
+        self.assertEqual(progress, [1, 2, 3])
+        self.assertEqual(reply, whole)
+
+    def test_a_partial_read_shows_no_numbers(self):
+        self.three()
+        reply = helper.read(self.args(budget=0))
+        self.assertTrue(reply["partial"])
+        self.assertNotIn("windows", reply)
+
+    def test_a_copied_folder_counts_once(self):
+        self.three()
+        copy = os.path.join(self.dir, "copy")
+        shutil.copytree(self.projects, copy)
+        reply = helper.read(self.args(projects=[self.projects, copy]))
+        self.assertEqual(reply["windows"]["all"]["sessions"], "3")
+        self.assertEqual(reply["windows"]["all"]["peak"]["count"], 2)
+
+    def test_two_folders_with_different_sessions_add_up(self):
+        self.three()
+        other = os.path.join(self.dir, "other")
+        self.write("d.jsonl", "d", "2026-07-03T09:30:00Z", "2026-07-03T09:40:00Z", root=other)
+        self.assertEqual(helper.read(self.args(projects=[self.projects, other]))["windows"]["all"]["sessions"], "4")
+
+    def test_a_file_too_big_is_left_out_and_counted(self):
+        self.three()
+        with mock.patch.object(helper, "MAX_FILE", 1):
+            reply = helper.read(self.args())
+        self.assertEqual(reply["leftOut"], 3)
+        self.assertTrue(reply["windows"]["all"]["empty"])
+
+    def test_an_unreadable_file_does_not_stop_the_rest(self):
+        self.three()
+        real = wrapped.parse_run
+
+        def fussy(path, *rest):
+            if path.endswith("b.jsonl"):
+                raise OSError("no")
+            return real(path, *rest)
+
+        with mock.patch.object(helper.wrapped, "parse_run", side_effect=fussy):
+            reply = helper.read(self.args())
+        self.assertEqual(reply["leftOut"], 1)
+        self.assertEqual(reply["windows"]["all"]["sessions"], "2")
+
+    def test_nothing_to_read_is_named(self):
+        os.makedirs(self.projects)
+        self.assertIn("No Claude Code transcripts found", helper.read(self.args())["error"])
+
+    def test_no_names_or_paths_in_the_reply_or_the_cache(self):
+        self.three()
+        reply = json.dumps(helper.read(self.args()))
+        for secret in ("secret-project", self.dir, "\"run_id\"", "top_project"):
+            self.assertNotIn(secret, reply)
+        with open(self.cache, encoding="utf-8") as f:
+            self.assertNotIn("secret-project", f.read())
+
+    def test_this_month_is_the_current_month(self):
+        self.three()
+        with mock.patch.object(helper, "datetime") as clock:
+            clock.now.return_value.strftime.return_value = "2026-06"
+            month = helper.read(self.args())["windows"]["month"]
+        self.assertEqual(month, {"window": "2026-06", "empty": True})
+
+    def test_an_empty_home_finds_nothing(self):
+        home = os.path.join(self.dir, "home")
+        os.makedirs(home)
+        env = {"HOME": home, "USERPROFILE": home}
+        with mock.patch.dict(os.environ, env), mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": ""}):
+            self.assertIn("error", helper.read(self.args(projects=None)))
+
+    def test_claude_folders_are_found_and_a_copy_adds_nothing(self):
+        home = os.path.join(self.dir, "home")
+        self.write("a.jsonl", "a", "2026-07-01T09:00:00Z", "2026-07-01T10:00:00Z", root=os.path.join(home, ".claude", "projects"))
+        self.write("a.jsonl", "a", "2026-07-01T09:00:00Z", "2026-07-01T10:00:00Z", root=os.path.join(home, ".claude-copy", "projects"))
+        os.makedirs(os.path.join(home, ".claude-empty", "projects"))
+        with mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home, "CLAUDE_CONFIG_DIR": ""}):
+            reply = helper.read(self.args(projects=None))
+        self.assertEqual(reply["total"], 1)
+        self.assertEqual(reply["windows"]["all"]["peak"]["count"], 1)
+
+    def test_save_falls_back_to_html_with_no_browser(self):
+        self.three()
+        out = os.path.join(self.dir, "Downloads")
+        with mock.patch.object(helper.wrapped, "find_browser", return_value=None):
+            reply = helper.save(self.args(out=out))
+        self.assertEqual(reply["kind"], "html")
+        self.assertTrue(reply["noBrowser"])
+        self.assertIn("no chromium-family browser", reply["why"])
+        with open(reply["saved"], encoding="utf-8") as f:
+            self.assertIn("most agents at once", f.read())
+
+    def test_a_hung_browser_falls_back_to_html(self):
+        self.three()
+        hung = subprocess.TimeoutExpired("browser", wrapped._RENDER_SECONDS)
+        with mock.patch.object(helper.wrapped, "find_browser", return_value="browser"),                 mock.patch.object(helper.wrapped.subprocess, "run", side_effect=hung) as ran:
+            reply = helper.save(self.args(out=self.dir))
+        self.assertEqual(ran.call_args.kwargs["timeout"], wrapped._RENDER_SECONDS)
+        self.assertLess(wrapped._RENDER_SECONDS + helper.SAVE_BUDGET, 28)
+        self.assertEqual(reply["kind"], "html")
+        self.assertFalse(reply["noBrowser"])
+        self.assertIn("more than 20 seconds", reply["why"])
+
+    def test_save_says_so_when_the_window_is_empty(self):
+        self.three()
+        with mock.patch.object(helper, "month_of", return_value="2020-01"):
+            reply = helper.save(self.args(out=self.dir, window="month"))
+        self.assertIn("Nothing to save", reply["error"])
+
+    def test_a_png_reply_names_the_png(self):
+        self.three()
+        with mock.patch.object(helper.wrapped, "render_png", return_value=(True, "ok")):
+            reply = helper.save(self.args(out=self.dir))
+        self.assertEqual(reply["kind"], "png")
+        self.assertTrue(reply["saved"].endswith(".png"))
+
+
+class Demo(unittest.TestCase):
+    def reply(self):
+        args = mock.Mock(demo=True, projects=None, cache=None, budget=15.0)
+        return helper.read(args)
+
+    def test_believable_for_a_heavy_user(self):
+        view = self.reply()["windows"]["all"]
+        self.assertEqual(view["unit"], "B")
+        self.assertLess(float(view["tokens"]), 10)
+        self.assertEqual(view["peak"]["count"], 12)
+        self.assertTrue(view["bottleneck"])
+        self.assertTrue(10 <= view["jar"]["count"] <= 60, view["jar"])
+
+    def test_the_same_every_time(self):
+        self.assertEqual(self.reply(), self.reply())
+
+    def test_this_month_is_the_samples_newest(self):
+        self.assertEqual(self.reply()["windows"]["month"]["window"], "2026-10")
+
+    def test_the_card_says_it_is_sample_data(self):
+        with tempfile.TemporaryDirectory() as out, mock.patch.object(helper.wrapped, "find_browser", return_value=None):
+            reply = helper.save(mock.Mock(demo=True, projects=None, cache=None, window="all", jar=False, out=out))
+            with open(reply["saved"], encoding="utf-8") as f:
+                self.assertIn("sample data", f.read())
+
+    def test_a_real_card_does_not(self):
+        s = helper.card_stats(wrapped.ingest_dir(os.path.join(MOD, "examples", "runs")), "all time")
+        self.assertNotIn("sample data", wrapped.html_card(s))
+        self.assertNotIn("sample data", wrapped.share_text(s)["x"])
+
+    def test_the_caption_says_so_too(self):
+        self.assertIn("(sample data)", self.reply()["windows"]["all"]["share"]["caption"])
+
+    def test_wrapped_card_demo_uses_it(self):
+        with tempfile.TemporaryDirectory() as out:
+            page = os.path.join(out, "card.html")
+            done = subprocess.run([sys.executable, "-B", os.path.join(MOD, "wrapped.py"), "card", "--demo", "--out", page],
+                                  capture_output=True, text=True, cwd=out)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            with open(page, encoding="utf-8") as f:
+                self.assertIn("sample data", f.read())
+
+
+class Card(unittest.TestCase):
+    def stats(self, count=4):
+        s = wrapped.wrapped_stats(wrapped.ingest_dir(os.path.join(MOD, "examples", "runs")))
+        s["peak"] = {"count": count, "date": "2026-07-01", "label": "jul 1"}
+        return s
+
+    def test_the_tile_says_what_it_counts(self):
+        card = wrapped.html_card(self.stats())
+        self.assertIn("most agents at once", card)
+        self.assertIn("sessions open together, idle ones count", card)
+        self.assertIn('<div class="v tabnum">4</div>', card)
+
+    def test_no_peak_is_the_source_card(self):
+        s = self.stats()
+        del s["peak"]
+        self.assertNotIn('class="tile agents"', wrapped.html_card(s))
+
+    def test_the_caption_says_what_it_counts(self):
+        caption = wrapped.share_text(self.stats())["x"]
+        self.assertIn("most agents at once: 4, idle ones included.", caption)
+        self.assertIn(wrapped.REPO, caption)
+
+    def test_a_big_history_still_fits_a_post(self):
+        s = self.stats(123)
+        s.update(total_tokens=123400000000, sessions=12345, tool_calls=2345678)
+        s["top_tool"] = {"name": "mcp__server__read_file", "count": 1234567}
+        s["bottleneck"] = {"worked": "12345h", "waited": "1234h"}
+        s["jar"] = {"fine": "$1,234.50", "count": 4938, "top": "f***"}
+        s["sample"] = True
+        self.assertLessEqual(len(wrapped.share_text(s)["x"]), 280)
+
+    def test_the_post_link_carries_the_caption(self):
+        reply = helper.view_of(wrapped.ingest_dir(os.path.join(MOD, "examples", "runs")), "all time")
+        url = reply["share"]["postUrl"]
+        self.assertTrue(url.startswith("https://twitter.com/intent/tweet?text="))
+        self.assertNotIn("\n", url)
+
+
+class Run(unittest.TestCase):
+    def test_the_way_the_mod_runs_it(self):
+        made = os.path.join(MOD, "__pycache__")
+        existed = os.path.isdir(made)
+        done = subprocess.run([sys.executable, "-I", "-S", "-B", os.path.join(MOD, "helper.py"), "read", "--demo"],
+                              capture_output=True, cwd=tempfile.gettempdir())
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertLess(len(done.stdout), 8 * 1024 * 1024)
+        self.assertTrue(done.stdout.isascii())
+        self.assertFalse(json.loads(done.stdout)["partial"])
+        self.assertEqual(os.path.isdir(made), existed)
+
+    def test_wrapped_selftest(self):
+        done = subprocess.run([sys.executable, "-B", os.path.join(MOD, "wrapped.py"), "selftest"], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
