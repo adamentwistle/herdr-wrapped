@@ -4,7 +4,7 @@ An overlay for Herdr that shows your Claude Code stats as a card to share: token
 
 ![Wrapped](preview.png)
 
-A mod for the [Herdr](https://github.com/ogulcancelik/herdr) desktop app. Built for macOS, and not yet run in a real window there.
+A mod for the [Herdr](https://github.com/ogulcancelik/herdr) desktop app. Built for macOS.
 
 Ask your agent to add it from [herdr.dev/mods](https://herdr.dev/gallery/?type=mods), or point it at this repo. It reads [the recipe](RECIPE.md) and every file first. By hand, copy `mods/wrapped` into `~/.config/herdr-app/mods` and merge `keys.json` into yours. `ctrl-shift-g` opens it.
 

@@ -6,6 +6,7 @@
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,25 @@ MOD = os.path.join(ROOT, "mods", "wrapped")
 sys.path.insert(0, MOD)
 import helper  # noqa: E402
 import wrapped  # noqa: E402
+
+
+# A stand-in for a headless browser: writes a blank PNG the size --window-size asks for at 2x, or not, then exits or
+# keeps running. Filled in with (writes, then_waits).
+FAKE_BROWSER = r'''import struct, sys, time, zlib
+writes, then_waits = %r, %r
+args = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
+w, h = (2 * int(n) for n in args["window-size"].split(","))
+def chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+if writes:
+    rows = (b"\x00" + b"\x00" * (3 * w)) * h
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) \
+        + chunk(b"IDAT", zlib.compress(rows, 1)) + chunk(b"IEND", b"")
+    with open(args["screenshot"], "wb") as f:
+        f.write(png)
+if then_waits:
+    time.sleep(60)
+'''
 
 
 def run(run_id, started, ended):
@@ -249,16 +269,55 @@ class Folder(unittest.TestCase):
         with open(reply["saved"], encoding="utf-8") as f:
             self.assertIn("most agents at once", f.read())
 
+    def browser(self, writes, then_waits):
+        """A stand-in browser: it writes the screenshot or not, then exits or keeps running."""
+        path = os.path.join(self.dir, "browser")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#!%s\n%s" % (sys.executable, FAKE_BROWSER % (writes, then_waits)))
+        os.chmod(path, 0o755)
+        return path
+
     def test_a_hung_browser_falls_back_to_html(self):
         self.three()
-        hung = subprocess.TimeoutExpired("browser", wrapped._RENDER_SECONDS)
-        with mock.patch.object(helper.wrapped, "find_browser", return_value="browser"),                 mock.patch.object(helper.wrapped.subprocess, "run", side_effect=hung) as ran:
-            reply = helper.save(self.args(out=self.dir))
-        self.assertEqual(ran.call_args.kwargs["timeout"], wrapped._RENDER_SECONDS)
         self.assertLess(wrapped._RENDER_SECONDS + helper.SAVE_BUDGET, 28)
+        with mock.patch.object(helper.wrapped, "find_browser", return_value=self.browser(False, True)), \
+                mock.patch.object(helper.wrapped, "_RENDER_SECONDS", 1):
+            reply = helper.save(self.args(out=self.dir))
         self.assertEqual(reply["kind"], "html")
         self.assertFalse(reply["noBrowser"])
-        self.assertIn("more than 20 seconds", reply["why"])
+        self.assertIn("more than 1 seconds", reply["why"])
+
+    def test_a_browser_that_keeps_running_after_its_screenshot_still_saves_the_png(self):
+        # Chrome 145 on macOS writes the screenshot and doesn't exit.
+        self.three()
+        with mock.patch.object(helper.wrapped, "find_browser", return_value=self.browser(True, True)), \
+                mock.patch.object(helper.wrapped, "_RENDER_SECONDS", 10):
+            reply = helper.save(self.args(out=self.dir))
+        self.assertEqual(reply["kind"], "png")
+        with open(reply["saved"], "rb") as f:
+            head = f.read(24)
+        self.assertEqual(struct.unpack(">II", head[16:24]), (2160, 2160))
+
+    def test_an_old_card_under_the_same_name_is_not_taken_for_the_new_one(self):
+        self.three()
+        with mock.patch.object(helper.wrapped, "find_browser", return_value=self.browser(True, False)):
+            first = helper.save(self.args(out=self.dir))
+        with mock.patch.object(helper.wrapped, "find_browser", return_value=self.browser(False, True)), \
+                mock.patch.object(helper.wrapped, "_RENDER_SECONDS", 1):
+            second = helper.save(self.args(out=self.dir))
+        self.assertEqual(first["kind"], "png")
+        self.assertEqual(second["kind"], "html")
+
+    def test_a_project_folder_name_stays_out_of_the_cache(self):
+        root = os.path.join(self.projects, "-Users-someone-Projects-secret-project")
+        self.write("a.jsonl", "a", "2026-07-01T09:00:00Z", "2026-07-01T10:00:00Z", root=root)
+        first = helper.read(self.args())
+        with open(self.cache, encoding="utf-8") as f:
+            cache = f.read()
+        self.assertNotIn("secret-project", cache)
+        self.assertNotIn(self.dir, cache)
+        with mock.patch.object(helper.wrapped, "parse_run", side_effect=AssertionError("parsed again")):
+            self.assertEqual(helper.read(self.args()), first)
 
     def test_save_says_so_when_the_window_is_empty(self):
         self.three()
