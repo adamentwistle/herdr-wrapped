@@ -2,7 +2,7 @@
 
 An overlay for Herdr that shows your Claude Code stats as a card to share: tokens, cost, tools, your busiest day, the most agents you had going at once, how long they waited for you, and a swear jar.
 
-![Wrapped](preview.png)
+![The Wrapped overlay on demo data over a Herdr window](preview.png)
 
 A mod for the [Herdr](https://github.com/ogulcancelik/herdr) desktop app. Built for macOS.
 

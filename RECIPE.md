@@ -2,7 +2,7 @@
 
 An overlay that shows a person their Claude Code stats as a card to share. One big token number, what it would have cost, how they worked, the most agents they had going at once, how long their agents waited for them, a swear jar, and a dry line picked by their own numbers. A key opens it over whatever they're doing. From it they can save the card as a PNG, copy a caption, or start a post on X.
 
-![Wrapped](preview.png)
+![The Wrapped overlay on demo data over a Herdr window](preview.png)
 
 ## What you see
 
