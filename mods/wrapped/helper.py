@@ -78,10 +78,25 @@ def peak_agents(runs):
     return {"count": best, "date": day, "label": wrapped.fmt_day(day)}
 
 
-def stats_cache_path():
-    """The active profile's stats-cache.json, which /stats reads: $CLAUDE_CONFIG_DIR, or ~/.claude without it."""
-    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-    return os.path.join(base, "stats-cache.json")
+def stats_cache_paths(profiles):
+    """Each read profile's stats-cache.json, the file /stats reads. Every profile's, not just the active one: Herdr starts
+    the helper without the shell's $CLAUDE_CONFIG_DIR, so "active" would depend on how Herdr was launched."""
+    return [os.path.join(os.path.dirname(p["dir"]), "stats-cache.json") for p in profiles]
+
+
+def merge_history(found):
+    """Several load_history results as one: per day, the most of each count, so a copied file adds nothing. Two real
+    profiles busy on the same day count as the busier one."""
+    found = [h for h in found if h]
+    if not found:
+        return None
+    days = {}
+    for h in found:
+        for day, d in h["days"].items():
+            have = days.setdefault(day, {"sessions": 0, "tools": 0, "tokens": 0})
+            for k in have:
+                have[k] = max(have[k], d[k])
+    return {"days": days, "unplaced": max(h["unplaced"] for h in found), "longest": max(h["longest"] for h in found)}
 
 
 def load_history(path):
@@ -287,12 +302,15 @@ def settings_of(cache_path):
     return found if isinstance(found, dict) else {}
 
 
+def profiles_for(args):
+    backups = settings_of(args.cache).get("includeBackups") is True
+    return [p for p in wrapped.discover_profiles() if p["files"] and (backups or p["active"] or not is_backup(p["name"]))]
+
+
 def roots_for(args):
     if args.projects:
         return args.projects
-    backups = settings_of(args.cache).get("includeBackups") is True
-    return [p["dir"] for p in wrapped.discover_profiles()
-            if p["files"] and (backups or p["active"] or not is_backup(p["name"]))]
+    return [p["dir"] for p in profiles_for(args)]
 
 
 def transcripts(roots):
@@ -420,7 +438,11 @@ def collect(roots, cache_path, budget):
 def history_for(args):
     if args.demo:
         return None
-    return load_history(args.stats or (None if args.projects else stats_cache_path()))
+    if args.stats:
+        return load_history(args.stats)
+    if args.projects:
+        return None
+    return merge_history([load_history(path) for path in stats_cache_paths(profiles_for(args))])
 
 
 def gather(args, budget):

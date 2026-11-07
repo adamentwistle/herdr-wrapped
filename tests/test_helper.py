@@ -414,9 +414,26 @@ class History(unittest.TestCase):
             f.write("{not json")
         self.assertEqual(self.all_time()["all"]["sessions"], "1")
 
-    def test_with_no_projects_named_it_reads_the_active_profiles_file(self):
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/somewhere/.claude-work"}):
-            self.assertEqual(helper.stats_cache_path(), "/somewhere/.claude-work/stats-cache.json")
+    def test_every_profiles_file_is_read_whatever_launched_herdr(self):
+        # Herdr runs the helper without the shell's $CLAUDE_CONFIG_DIR, so the files can't hang on which profile is active.
+        home = os.path.join(self.dir, "home")
+        for name, days in ((".claude", [("2026-06-01", 3, 1, 90)]), (".claude-work", [("2026-07-01", 2, 5, 1200), ("2026-07-02", 1, 2, 600)])):
+            os.makedirs(os.path.join(home, name, "projects", "p"))
+            open(os.path.join(home, name, "projects", "p", "x.jsonl"), "w").close()
+            stats_cache(os.path.join(home, name, "stats-cache.json"), days)
+        os.makedirs(os.path.join(home, ".claude-work", "projects", "proj"))
+        self.write("c.jsonl", "c", "2026-07-02T09:30:00Z", "2026-07-02T09:40:00Z", root=os.path.join(home, ".claude-work", "projects"))
+        for env in ({}, {"CLAUDE_CONFIG_DIR": os.path.join(home, ".claude")}, {"CLAUDE_CONFIG_DIR": os.path.join(home, ".claude-work")}):
+            with mock.patch.dict(os.environ, {"HOME": home, **env}), mock.patch.dict(os.environ, {} if env else {"CLAUDE_CONFIG_DIR": ""}):
+                if not env:
+                    os.environ.pop("CLAUDE_CONFIG_DIR")
+                with mock.patch.object(helper, "today_of", return_value=date(2026, 7, 2)):
+                    view = helper.read(self.args(projects=None, stats=None, cache=os.path.join(self.dir, "c%d.json" % len(env))))["windows"]["all"]
+            self.assertEqual((view["sessions"], view["historyDays"]), ("6", 2), env)
+
+    def test_a_copied_file_adds_nothing(self):
+        day = {"days": {"2026-07-01": {"sessions": 2, "tools": 5, "tokens": 1200}}, "unplaced": 10, "longest": 7}
+        self.assertEqual(helper.merge_history([day, day, None]), day)
 
 
 class Backups(unittest.TestCase):
