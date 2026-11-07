@@ -3,7 +3,7 @@
 // renders when its state changes and not on a timer.
 import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { WINDOWS, bottleneckNote, bottleneckText, canAct, emptyText, jarRows, jarText, leftOutText, progressText, stripNote } from "./logic.js";
+import { WINDOWS, bottleneckNote, bottleneckText, canAct, emptyText, jarRows, jarText, leftOutText, progressText, stripNote, tokensNote } from "./logic.js";
 
 const PAD = 28;
 const STRIP_H = 56;
@@ -35,7 +35,7 @@ function hero(w, t) {
     .child(h_flex().items_end().gap(4)
       .child(div().text_size(112).line_height(1).font_bold().text_color(t.accent).child(w.tokens))
       .when(Boolean(w.unit), (e) => e.child(div().pb(12).text_size(56).line_height(1).font_semibold().text_color(t.accent).child(w.unit))))
-    .child(div().pt(6).text_size(13).text_color(t.muted).child(`Cache included: ${w.fromCache} from cache, ${w.newTokens} new`));
+    .child(div().pt(6).text_size(13).text_color(t.muted).child(tokensNote(w)));
 }
 
 const block = (t) => v_flex().flex_none().p(14).gap(4).rounded(12).bg(t.canvas);

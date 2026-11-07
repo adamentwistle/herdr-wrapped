@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Reads Claude Code's transcripts for the Wrapped overlay. It opens them for reading only and uses no network.
 
-  helper.py read --cache FILE [--demo] [--projects DIR ...] [--budget SECONDS]
-  helper.py save --cache FILE --window all|month --out DIR [--jar] [--demo] [--projects DIR ...]
+  helper.py read --cache FILE [--demo] [--projects DIR ...] [--stats FILE] [--budget SECONDS]
+  helper.py save --cache FILE --window all|7d|30d --out DIR [--jar] [--demo] [--projects DIR ...] [--stats FILE]
+
+--stats is Claude Code's own stats-cache.json, the file behind /stats. It defaults to the active profile's when no
+--projects are given. Claude Code deletes old transcripts, but that file keeps a line per day, so All time fills in the
+days whose transcripts are gone from it. See history_of.
 
 `read` prints the overlay's numbers for both windows as one line of JSON. Transcripts can total gigabytes, so each file's
 parsed result is kept in --cache against its size and modified time, and only new or changed files are parsed. A pass
@@ -23,7 +27,7 @@ import os
 import re
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
@@ -38,6 +42,8 @@ SAVE_BUDGET = 4.0
 MAX_FILE = 256 * 1024 * 1024
 STRIP_BARS = 56
 TOOL_LIMIT = 16
+WINDOW_DAYS = {"7d": 7, "30d": 30}
+WINDOW_LABELS = {"all": "all time", "7d": "last 7 days", "30d": "last 30 days"}
 REQUEST_ID = re.compile(rb'"requestId"\s*:\s*"([^"]+)"')
 
 
@@ -72,10 +78,116 @@ def peak_agents(runs):
     return {"count": best, "date": day, "label": wrapped.fmt_day(day)}
 
 
-def card_stats(runs, window, jar=False, made_up=False):
+def stats_cache_path():
+    """The active profile's stats-cache.json, which /stats reads: $CLAUDE_CONFIG_DIR, or ~/.claude without it."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(base, "stats-cache.json")
+
+
+def load_history(path):
+    """Claude Code's stats-cache.json as {"days": {date: {...}}, "unplaced", "longest"}, or None. Only counts are taken
+    from it. Its tokens are counted Claude Code's way, which see history_of."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    days = {}
+    for d in raw.get("dailyActivity") or []:
+        if isinstance(d, dict) and isinstance(d.get("date"), str):
+            days[d["date"]] = {"sessions": wrapped._int(d.get("sessionCount")), "tools": wrapped._int(d.get("toolCallCount")),
+                               "tokens": 0}
+    placed = 0
+    for d in raw.get("dailyModelTokens") or []:
+        if isinstance(d, dict) and isinstance(d.get("tokensByModel"), dict) and isinstance(d.get("date"), str):
+            n = sum(wrapped._int(v) for v in d["tokensByModel"].values())
+            days.setdefault(d["date"], {"sessions": 0, "tools": 0, "tokens": 0})["tokens"] = n
+            placed += n
+    total = 0
+    for u in (raw.get("modelUsage") or {}).values():
+        if isinstance(u, dict):
+            total += sum(wrapped._int(u.get(k)) for k in ("inputTokens", "outputTokens", "cacheReadInputTokens",
+                                                            "cacheCreationInputTokens"))
+    longest = raw.get("longestSession") if isinstance(raw.get("longestSession"), dict) else {}
+    return {"days": days, "unplaced": max(0, total - placed), "longest": wrapped._int(longest.get("duration"))}
+
+
+def history_of(runs, history):
+    """What the stats cache adds to these runs: for each day where it knows of more sessions than the transcripts do,
+    because Claude Code has deleted them, its day replaces theirs. Returns None when it adds nothing.
+
+    Claude Code writes one transcript line per content block of a reply, and each line repeats the whole reply's usage.
+    wrapped.py counts a reply once. /stats adds up every line, so its tokens run about twice as high. Its day totals are
+    scaled by what the transcripts give on the days both have in full, so the two sources agree on what a token is. Cost
+    and the cache share follow the transcripts' own rates."""
+    if not history:
+        return None
+    by_day = {}
+    for r in runs:
+        d = by_day.setdefault((r["started"] or "")[:10], {"sessions": set(), "tokens": 0, "tools": 0})
+        if not r.get("is_subagent"):
+            d["sessions"].add(r["run_id"])
+        d["tokens"] += r["tokens"]
+        d["tools"] += r["tool_calls"]
+    ours = theirs = 0
+    for day, h in history["days"].items():
+        mine = by_day.get(day)
+        if mine and h["tokens"] and len(mine["sessions"]) == h["sessions"]:
+            ours, theirs = ours + mine["tokens"], theirs + h["tokens"]
+    scale = ours / theirs if theirs else 1.0
+    added = {"sessions": 0, "tokens": 0, "tools": 0, "days": {}}
+    for day, h in history["days"].items():
+        mine = by_day.get(day) or {"sessions": (), "tokens": 0, "tools": 0}
+        if h["sessions"] <= len(mine["sessions"]):
+            continue
+        tokens = max(0, round(h["tokens"] * scale) - mine["tokens"])
+        added["sessions"] += h["sessions"] - len(mine["sessions"])
+        added["tools"] += max(0, h["tools"] - mine["tools"])
+        added["tokens"] += tokens
+        added["days"][day] = tokens
+    if not added["days"]:
+        return None
+    added["tokens"] += round(history["unplaced"] * scale)
+    added["longest"] = history["longest"]
+    return added
+
+
+def with_history(stats, added):
+    """Folds history_of's days into wrapped.py's stats, and works the punchlines out again."""
+    total = stats["total_tokens"]
+    share = stats["tokens_from_cache"] / total if total else 0.0
+    rate = stats["cost_usd"] / total if total else 0.0
+    stats["total_tokens"] += added["tokens"]
+    stats["tokens_from_cache"] += round(added["tokens"] * share)
+    stats["tokens_new"] = stats["total_tokens"] - stats["tokens_from_cache"]
+    stats["cost_usd"] = round(stats["cost_usd"] + added["tokens"] * rate, 6)
+    stats["sessions"] += added["sessions"]
+    stats["tool_calls"] += added["tools"]
+    days = {d["date"]: d["tokens"] for d in stats["activity"]}
+    for day, tokens in added["days"].items():
+        days[day] = days.get(day, 0) + tokens
+    stats["activity"] = [{"date": d, "tokens": n} for d, n in sorted(days.items())]
+    top = max(days.items(), key=lambda kv: (kv[1], kv[0]))
+    stats["busiest_day"] = {"date": top[0], "tokens": top[1], "label": wrapped.fmt_day(top[0])}
+    if added["longest"] > (stats["longest_session"] or {}).get("span_ms", 0):
+        stats["longest_session"] = {"run_id": None, "span_ms": added["longest"], "human": wrapped.fmt_duration(added["longest"])}
+    stats["history_days"] = len(added["days"])
+    stats["insights"] = wrapped.insights(stats)
+    return stats
+
+
+def card_stats(runs, window, jar=False, made_up=False, history=None):
     """wrapped.py's stats for these runs, with what goes on the card beside them. The Swear Jar only joins them when `jar`
-    is set, so with sharing off there's nothing in the stats for the card or a caption to show."""
+    is set, so with sharing off there's nothing in the stats for the card or a caption to show. `history` is
+    load_history's, given for All time only: the peak, the Bottleneck, the jar and the top tool stay the transcripts'."""
     stats = wrapped.wrapped_stats(runs, window)
+    added = history_of(runs, history)
+    if added:
+        stats = with_history(stats, added)
     stats["peak"] = peak_agents(runs)
     stats["bottleneck"] = habits.bottleneck_of(runs)
     if jar:
@@ -91,6 +203,23 @@ def sample_stats(month=None):
     """The made-up stats, for `wrapped.py demo` and `wrapped.py card --demo`."""
     runs = sample.runs()
     return card_stats(wrapped.filter_month(runs, month), month or "all time", made_up=True)
+
+
+def filter_days(runs, days, today):
+    """The runs that started in the last `days` days, today included, by the UTC date wrapped.py files a session under."""
+    first = (today - timedelta(days=days - 1)).isoformat()
+    return [r for r in runs if (r["started"] or "")[:10] >= first]
+
+
+def today_of(runs, demo):
+    """Today. A demo's today is the newest day in its made-up runs, so its windows aren't empty."""
+    if demo and runs:
+        return date.fromisoformat(max((r["started"] or "")[:10] for r in runs))
+    return date.today()
+
+
+def window_runs(runs, key, demo):
+    return runs if key == "all" else filter_days(runs, WINDOW_DAYS[key], today_of(runs, demo))
 
 
 def strip_of(activity):
@@ -110,10 +239,10 @@ def post_of(stats):
     return {"caption": caption, "postUrl": wrapped.x_intent_url(caption)}
 
 
-def view_of(runs, window, made_up=False):
+def view_of(runs, window, made_up=False, history=None):
     """What the overlay draws, formatted the way the card formats it. Names, paths, ids and prompts stay out. `share` has
     the caption without the Swear Jar, and `shareJar` the one with it, for when the person has turned sharing on."""
-    stats = card_stats(runs, window, made_up=made_up)
+    stats = card_stats(runs, window, made_up=made_up, history=history)
     if not runs:
         return {"window": window, "empty": True}
     number, unit = wrapped._split_compact(wrapped.fmt_tokens(stats["total_tokens"]))
@@ -137,9 +266,10 @@ def view_of(runs, window, made_up=False):
         "capMinutes": habits.WAIT_CAP_MS // 60000,
         "jar": {**jar, "rights": format(stats["absolutely_right"], ",")},
         "strip": strip_of(stats["activity"]),
+        "historyDays": stats.get("history_days", 0),
         "punchline": stats["insights"][0]["line"] if stats["insights"] else "",
         "share": post_of(stats),
-        "shareJar": post_of(card_stats(runs, window, jar=True, made_up=made_up)),
+        "shareJar": post_of(card_stats(runs, window, jar=True, made_up=made_up, history=history)),
     }
 
 
@@ -271,11 +401,10 @@ def collect(roots, cache_path, budget):
     return runs, {"read": len(found) - waiting, "total": len(found), "leftOut": left_out}
 
 
-def month_of(runs, demo):
-    """This month's YYYY-MM. A demo's month is the newest in its made-up runs."""
-    if demo:
-        return max((r["started"] or "")[:7] for r in runs)
-    return datetime.now().strftime("%Y-%m")
+def history_for(args):
+    if args.demo:
+        return None
+    return load_history(args.stats or (None if args.projects else stats_cache_path()))
 
 
 def gather(args, budget):
@@ -291,22 +420,21 @@ def read(args):
         return {"error": "No Claude Code transcripts found. Looked in $CLAUDE_CONFIG_DIR and in projects under each ~/.claude* folder."}
     if progress["read"] < progress["total"]:
         return {"partial": True, **progress}
-    month = month_of(runs, args.demo) if runs else datetime.now().strftime("%Y-%m")
+    history = history_for(args)
     return {"partial": False, **progress, "windows": {
-        "all": view_of(runs, "all time", args.demo),
-        "month": view_of(wrapped.filter_month(runs, month), month, args.demo),
+        key: view_of(window_runs(runs, key, args.demo), WINDOW_LABELS[key], args.demo, history if key == "all" else None)
+        for key in ("7d", "30d", "all")
     }}
 
 
 def save(args):
     runs, _progress = gather(args, SAVE_BUDGET)
-    label = "all time"
-    if args.window == "month":
-        label = month_of(runs, args.demo) if runs else datetime.now().strftime("%Y-%m")
-        runs = wrapped.filter_month(runs, label)
+    label = WINDOW_LABELS[args.window]
+    history = history_for(args) if args.window == "all" else None
+    runs = window_runs(runs, args.window, args.demo)
     if not runs:
         return {"error": "Nothing to save: this window has no sessions."}
-    html = wrapped.html_card(card_stats(runs, label, jar=args.jar, made_up=args.demo), "square")
+    html = wrapped.html_card(card_stats(runs, label, jar=args.jar, made_up=args.demo, history=history), "square")
     os.makedirs(args.out, exist_ok=True)
     name = "claude-code-wrapped-%s-%s" % (label.replace(" ", "-"), "demo" if args.demo else date.today().isoformat())
     png = os.path.join(args.out, name + ".png")
@@ -326,8 +454,9 @@ def main(argv):
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--jar", action="store_true")
     parser.add_argument("--projects", action="append")
+    parser.add_argument("--stats")
     parser.add_argument("--budget", type=float, default=READ_BUDGET)
-    parser.add_argument("--window", choices=["all", "month"], default="all")
+    parser.add_argument("--window", choices=["all", "7d", "30d"], default="all")
     parser.add_argument("--out")
     args = parser.parse_args(argv)
     try:

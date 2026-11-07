@@ -1,6 +1,6 @@
 // What the overlay works out, kept apart from drawing. No Herdr imports, so `node --test` can load this file.
 export const HELPER_MS = 28000;
-export const WINDOWS = [{ key: "all", label: "All time" }, { key: "month", label: "This month" }];
+export const WINDOWS = [{ key: "7d", label: "Last 7 days" }, { key: "30d", label: "Last 30 days" }, { key: "all", label: "All time" }];
 
 // Rejects once `ms` has passed with no answer, so one hung call can't hold the overlay. `sleep` is `cx.sleep`.
 export function timed(promise, ms, what, sleep) {
@@ -74,7 +74,16 @@ export function postFailure(result) {
   return `The open command failed (${String(why).slice(0, 120)}). Copy caption still works.`;
 }
 
-export const emptyText = (key) => (key === "month" ? "No Claude Code sessions this month yet." : "No Claude Code sessions yet.");
+const EMPTY = { "7d": "No Claude Code sessions in the last 7 days.", "30d": "No Claude Code sessions in the last 30 days." };
+export const emptyText = (key) => EMPTY[key] ?? "No Claude Code sessions yet.";
+
+// The hero's small print. Days whose transcripts Claude Code has deleted come from its own stats file, and say so.
+export function tokensNote(view) {
+  const cache = `Cache included: ${view.fromCache} from cache, ${view.newTokens} new`;
+  if (!view.historyDays) return cache;
+  const days = view.historyDays === 1 ? "1 day" : `${view.historyDays.toLocaleString("en-US")} days`;
+  return `${cache}. ${days} from Claude Code's stats, as its transcripts are gone.`;
+}
 
 // How the strip's corner reads.
 export function stripNote(view) {
