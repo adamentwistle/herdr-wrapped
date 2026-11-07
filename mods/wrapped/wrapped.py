@@ -184,11 +184,13 @@ def parse_run(path, extra=None, skip_requests=()):
             groups[rid] = {"usage": {}, "model": None, "tools": []}
             order.append(rid)
         g = groups[rid]
-        # records sharing a requestId repeat cumulative usage; keep the one with
-        # the most tokens so an empty or partial trailing usage cannot zero it out.
+        # claude code writes one line per content block, each repeating the reply's
+        # usage. /stats adds up every line, and so does this, so the totals agree
+        # with /stats. tool calls are still counted once per tool_use id.
         u = msg.get("usage")
-        if isinstance(u, dict) and _usage_total(u) >= _usage_total(g["usage"]):
-            g["usage"] = u
+        if isinstance(u, dict):
+            for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+                g["usage"][k] = _int(g["usage"].get(k)) + _int(u.get(k))
         if msg.get("model"):
             g["model"] = msg["model"]
         for block in content:
@@ -1290,23 +1292,23 @@ def selftest():
     if s["sessions"] != 3:
         problems.append("expected 3 sessions, got %d" % s["sessions"])
     # s1: two records share reqA (cumulative usage) -> collapsed to ONE turn, so
-    # tokens are 3000 not 6000 and the Bash tool_use (deduped by id) counts once.
+    # tokens are 6000, each line's usage counted as /stats does, and the Bash tool_use (deduped by id) counts once.
     r1 = by.get("s1", {})
-    if r1.get("tokens") != 3000:
-        problems.append("s1 should collapse shared-requestId records to 3000 tokens, got %r" % r1.get("tokens"))
-    if abs(r1.get("cost_usd", 0) - 0.035) > 1e-9:
-        problems.append("s1 cost expected 0.035 (deduped), got %s" % r1.get("cost_usd"))
+    if r1.get("tokens") != 6000:
+        problems.append("s1 should count every line's usage, 6000 tokens, got %r" % r1.get("tokens"))
+    if abs(r1.get("cost_usd", 0) - 0.07) > 1e-9:
+        problems.append("s1 cost expected 0.07 (per line), got %s" % r1.get("cost_usd"))
     if r1.get("tools") != {"Bash": 1}:
         problems.append("s1 tools expected {Bash:1}, got %r" % r1.get("tools"))
     if r1.get("absolutely_right") != 1:
         problems.append("s1 absolutely_right expected 1, got %r" % r1.get("absolutely_right"))
 
-    # total tokens (throughput incl cache): s1 3000 + s2 8500 + s3 5000 = 16500;
-    # cost priced with cache (read 0.1x, write 1.25x): 0.035 + 0.083 + 0.05275 = 0.17075.
-    if s["total_tokens"] != 16500:
-        problems.append("total tokens expected 16500, got %d" % s["total_tokens"])
-    if abs(s["cost_usd"] - 0.17075) > 1e-9:
-        problems.append("total cost expected 0.17075, got %s" % s["cost_usd"])
+    # total tokens (throughput incl cache): s1 6000 + s2 8500 + s3 10000 = 24500;
+    # cost priced with cache (read 0.1x, write 1.25x): 0.07 + 0.083 + 0.1055 = 0.2585.
+    if s["total_tokens"] != 24500:
+        problems.append("total tokens expected 24500, got %d" % s["total_tokens"])
+    if abs(s["cost_usd"] - 0.2585) > 1e-9:
+        problems.append("total cost expected 0.2585, got %s" % s["cost_usd"])
 
     # the meme stat counts per-occurrence and is case + apostrophe insensitive:
     # s1 "you're" x1, s2 "You're...you're" x2, s3 x0 -> 3.
@@ -1319,26 +1321,26 @@ def selftest():
     if s["tool_calls"] != 6:
         problems.append("tool_calls expected 6, got %d" % s["tool_calls"])
 
-    # longest session is s2 (09:00 -> 12:12 = 3h 12m); busiest day is 2026-06-30
+    # longest session is s2 (09:00 -> 12:12 = 3h 12m); busiest day is 2026-07-01
     # (6700 tokens); both derived, not hardcoded.
     if not s["longest_session"] or s["longest_session"]["run_id"] != "s2" \
             or s["longest_session"]["human"] != "3h 12m":
         problems.append("longest_session expected s2 / 3h 12m, got %r" % s["longest_session"])
-    if not s["busiest_day"] or s["busiest_day"]["date"] != "2026-06-30" \
-            or s["busiest_day"]["label"] != "jun 30":
-        problems.append("busiest_day expected 2026-06-30 / jun 30, got %r" % s["busiest_day"])
+    if not s["busiest_day"] or s["busiest_day"]["date"] != "2026-07-01" \
+            or s["busiest_day"]["label"] != "jul 1":
+        problems.append("busiest_day expected 2026-07-01 / jul 1, got %r" % s["busiest_day"])
 
-    # top project by tokens (incl cache) is beta (s2 8500 > alpha s1 3000 + s3 5000 = 8000).
-    if not s["top_project"] or s["top_project"]["name"] != "beta" \
-            or s["top_project"]["tokens"] != 8500:
-        problems.append("top_project expected beta / 8500, got %r" % s["top_project"])
+    # top project by tokens (incl cache) is alpha (s1 6000 + s3 10000 = 16000 > beta s2 8500).
+    if not s["top_project"] or s["top_project"]["name"] != "alpha" \
+            or s["top_project"]["tokens"] != 16000:
+        problems.append("top_project expected alpha / 16000, got %r" % s["top_project"])
 
-    # --month windows to just that month; july keeps only s3 (5000 tokens incl cache).
+    # --month windows to just that month; july keeps only s3 (10000 tokens incl cache).
     july = filter_month(runs, "2026-07")
     if {r["run_id"] for r in july} != {"s3"}:
         problems.append("--month 2026-07 should keep only s3, got %r" % [r["run_id"] for r in july])
-    if wrapped_stats(july)["total_tokens"] != 5000:
-        problems.append("july total tokens expected 5000, got %d" % wrapped_stats(july)["total_tokens"])
+    if wrapped_stats(july)["total_tokens"] != 10000:
+        problems.append("july total tokens expected 10000, got %d" % wrapped_stats(july)["total_tokens"])
 
     # formatting helpers are deterministic.
     checks = [(fmt_tokens(14200), "14.2K"), (fmt_tokens(128400000), "128.4M"),
@@ -1358,7 +1360,7 @@ def selftest():
     card = html_card(s)  # default square
     if "<style>" not in card or "http://" in card or "https://" in card or "<script" in card:
         problems.append("the card should be self-contained (inline style, no remote, no script)")
-    for needed in ('class="card square"', "16.5", "$0.17", "Bash", "jun 30", "all time",
+    for needed in ('class="card square"', "24.5", "$0.26", "Bash", "jul 1", "all time",
                    "from cache", "api-equivalent cost", 'class="bar', "absolutely right"):
         if needed not in card:
             problems.append("the card is missing %r" % needed)
@@ -1510,7 +1512,7 @@ def selftest():
             problems.append("share caption %r recycles the insight" % key)
         if "\u2014" in cap or "\u2013" in cap:
             problems.append("share caption %r has an em/en dash" % key)
-    if "16.5K" not in st["x"] or "whose is scarier" not in st["x"]:
+    if "24.5K" not in st["x"] or "whose is scarier" not in st["x"]:
         problems.append("x caption should lead with the numbers and invite comparison, got %r" % st["x"])
     if "bash 3 times" not in st["x"]:
         problems.append("x caption should carry the top-tool stat, got %r" % st["x"])
@@ -1560,10 +1562,10 @@ def selftest():
         for p in problems:
             print("  - " + p)
         return 1
-    print("PASS: 3 fixture sessions, deterministic. total 16.5K tokens (incl cache) "
-          "/ $0.17075 (requestId-deduped, cache priced); \"you're absolutely right\" "
+    print("PASS: 3 fixture sessions, deterministic. total 24.5K tokens (incl cache) "
+          "/ $0.2585 (usage per line as /stats counts, cache priced); \"you're absolutely right\" "
           "x3 (case + apostrophe insensitive, per-occurrence); top tool Bash x3; "
-          "longest session s2 3h 12m; busiest day jun 30; top project beta (8500); "
+          "longest session s2 3h 12m; busiest day jul 1; top project alpha (16000); "
           "--month windows to s3; formatters check out; stylesheet sound (wide rule "
           "present); chart covers the full window (zero-filled, bucketed, sparse "
           "end+peak labels); no project name ever reaches the card; captions are "

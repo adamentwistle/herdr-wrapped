@@ -18,10 +18,10 @@ test("the helper runs isolated, and its cache stays out of mods/", () => {
 });
 
 test("a save passes its window and folder, and demo reaches the helper", () => {
-  const args = logic.helperArgs(appHome, "save", { demo: true, window: "month", out: `${home}/Downloads` });
+  const args = logic.helperArgs(appHome, "save", { demo: true, window: "30d", out: `${home}/Downloads` });
   assert.equal(args[4], "save");
   assert.ok(args.includes("--demo"));
-  assert.equal(args[args.indexOf("--window") + 1], "month");
+  assert.equal(args[args.indexOf("--window") + 1], "30d");
   assert.equal(args[args.indexOf("--out") + 1], `${home}/Downloads`);
 });
 
@@ -131,4 +131,15 @@ test("the overlay opens by key, with no layout change", () => {
   assert.ok(!["ctrl-shift-j", "ctrl-shift-y", "cmd-shift-u"].includes(key));
   const defaults = "bcdeklnoptvwxz".split("").filter((l) => l !== "d").map((l) => `ctrl-shift-${l}`);
   assert.ok(!defaults.includes(key));
+});
+
+test("the windows are the last 7 days, the last 30 days and all time", () => {
+  assert.deepEqual(logic.WINDOWS.map((w) => [w.key, w.label]), [["7d", "Last 7 days"], ["30d", "Last 30 days"], ["all", "All time"]]);
+  assert.equal(logic.emptyText("7d"), "No Claude Code sessions in the last 7 days.");
+});
+
+test("the hero names days that came from Claude Code's stats", () => {
+  const view = { fromCache: "1B", newTokens: "2M" };
+  assert.equal(logic.tokensNote(view), "Cache included: 1B from cache, 2M new");
+  assert.equal(logic.tokensNote({ ...view, historyDays: 1 }), "Cache included: 1B from cache, 2M new. 1 day from Claude Code's stats, as its transcripts are gone.");
 });

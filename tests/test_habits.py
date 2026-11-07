@@ -241,7 +241,7 @@ class OnDisk(unittest.TestCase):
                                 dict(prompt(7, "again"), sessionId="s1"), self.assistant(9, "r2")])
 
     def args(self, **more):
-        return mock.Mock(**{"demo": False, "projects": [self.projects], "cache": self.cache, "budget": 15.0, "window": "all", "out": self.dir, "jar": False, **more})
+        return mock.Mock(**{"demo": False, "projects": [self.projects], "cache": self.cache, "budget": 15.0, "stats": None, "window": "all", "out": self.dir, "jar": False, **more})
 
     def view(self):
         return helper.read(self.args())["windows"]["all"]

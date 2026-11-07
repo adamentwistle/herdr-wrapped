@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -129,7 +130,7 @@ class Folder(unittest.TestCase):
         return path
 
     def args(self, budget=15.0, **more):
-        values = {"demo": False, "projects": [self.projects], "cache": self.cache, "budget": budget, "window": "all", "out": None}
+        values = {"demo": False, "projects": [self.projects], "cache": self.cache, "budget": budget, "stats": None, "window": "all", "out": None}
         return mock.Mock(**{**values, **more})
 
     def three(self):
@@ -234,12 +235,18 @@ class Folder(unittest.TestCase):
         with open(self.cache, encoding="utf-8") as f:
             self.assertNotIn("secret-project", f.read())
 
-    def test_this_month_is_the_current_month(self):
+    def test_the_last_7_and_30_days_count_back_from_today(self):
         self.three()
-        with mock.patch.object(helper, "datetime") as clock:
-            clock.now.return_value.strftime.return_value = "2026-06"
-            month = helper.read(self.args())["windows"]["month"]
-        self.assertEqual(month, {"window": "2026-06", "empty": True})
+        with mock.patch.object(helper, "today_of", return_value=date(2026, 7, 8)):
+            windows = helper.read(self.args())["windows"]
+        self.assertEqual(windows["7d"]["window"], "last 7 days")
+        self.assertEqual(windows["7d"]["sessions"], "1")
+        self.assertEqual(windows["30d"]["sessions"], "3")
+        with mock.patch.object(helper, "today_of", return_value=date(2026, 9, 1)):
+            windows = helper.read(self.args())["windows"]
+        self.assertEqual(windows["7d"], {"window": "last 7 days", "empty": True})
+        self.assertEqual(windows["30d"], {"window": "last 30 days", "empty": True})
+        self.assertEqual(windows["all"]["sessions"], "3")
 
     def test_an_empty_home_finds_nothing(self):
         home = os.path.join(self.dir, "home")
@@ -321,8 +328,8 @@ class Folder(unittest.TestCase):
 
     def test_save_says_so_when_the_window_is_empty(self):
         self.three()
-        with mock.patch.object(helper, "month_of", return_value="2020-01"):
-            reply = helper.save(self.args(out=self.dir, window="month"))
+        with mock.patch.object(helper, "today_of", return_value=date(2026, 9, 1)):
+            reply = helper.save(self.args(out=self.dir, window="7d"))
         self.assertIn("Nothing to save", reply["error"])
 
     def test_a_png_reply_names_the_png(self):
@@ -333,9 +340,153 @@ class Folder(unittest.TestCase):
         self.assertTrue(reply["saved"].endswith(".png"))
 
 
+def stats_cache(path, days, longest=0, unplaced=0):
+    """A stats-cache.json like Claude Code's: days are (date, sessions, tools, tokens)."""
+    placed = sum(d[3] for d in days)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"version": 5,
+                   "dailyActivity": [{"date": d, "sessionCount": n, "toolCallCount": t, "messageCount": 1} for d, n, t, _ in days],
+                   "dailyModelTokens": [{"date": d, "tokensByModel": {"claude-opus-4-8": k}} for d, _, _, k in days],
+                   "modelUsage": {"claude-opus-4-8": {"inputTokens": placed + unplaced, "outputTokens": 0,
+                                                      "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}},
+                   "longestSession": {"duration": longest}}, f)
+    return path
+
+
+class History(unittest.TestCase):
+    """Claude Code deletes old transcripts, but /stats keeps a line per day in stats-cache.json. All time fills the days
+    whose transcripts are gone from it. Each file self.write makes is one session of 300 tokens and 2 tool calls."""
+
+    setUp_folder = Folder.setUp
+    write = Folder.write
+    args = Folder.args
+
+    def setUp(self):
+        self.setUp_folder()
+        self.write("c.jsonl", "c", "2026-07-02T09:30:00Z", "2026-07-02T09:40:00Z")
+        self.stats = os.path.join(self.dir, "stats-cache.json")
+
+    def all_time(self, **more):
+        with mock.patch.object(helper, "today_of", return_value=date(2026, 7, 2)):
+            return helper.read(self.args(stats=self.stats, **more))["windows"]
+
+    def test_a_day_with_no_transcripts_comes_from_the_stats_file(self):
+        stats_cache(self.stats, [("2026-07-01", 2, 5, 1200), ("2026-07-02", 1, 2, 600)])
+        view = self.all_time()["all"]
+        self.assertEqual(view["sessions"], "3")
+        self.assertEqual(view["toolCalls"], "7")
+        self.assertEqual((view["tokens"], view["unit"]), ("1.5", "K"))
+        self.assertEqual(view["historyDays"], 1)
+        self.assertEqual(view["strip"]["from"], "jul 1")
+        self.assertEqual(view["busiest"]["label"], "jul 1")
+
+    def test_a_day_the_transcripts_have_in_full_is_not_counted_twice(self):
+        stats_cache(self.stats, [("2026-07-02", 1, 2, 600)])
+        view = self.all_time()["all"]
+        self.assertEqual((view["sessions"], view["tokens"], view["historyDays"]), ("1", "300", 0))
+
+    def test_a_day_with_some_transcripts_gone_takes_the_fuller_count(self):
+        self.write("d.jsonl", "d", "2026-07-01T09:00:00Z", "2026-07-01T09:10:00Z")
+        stats_cache(self.stats, [("2026-07-01", 3, 6, 1800), ("2026-07-02", 1, 2, 600)])
+        view = self.all_time()["all"]
+        self.assertEqual(view["sessions"], "4")
+        self.assertEqual(view["toolCalls"], "8")
+        self.assertEqual((view["tokens"], view["unit"]), ("2.1", "K"))
+
+    def test_tokens_with_no_day_still_count_toward_all_time(self):
+        stats_cache(self.stats, [("2026-07-01", 2, 5, 1200), ("2026-07-02", 1, 2, 600)], unplaced=200)
+        view = self.all_time()["all"]
+        self.assertEqual((view["tokens"], view["unit"]), ("1.7", "K"))
+
+    def test_the_longest_session_can_come_from_the_stats_file(self):
+        stats_cache(self.stats, [("2026-06-01", 1, 0, 0), ("2026-07-02", 1, 2, 600)], longest=(4 * 24 + 23) * 3600000 + 6 * 60000)
+        self.assertEqual(self.all_time()["all"]["longest"], wrapped.fmt_duration((4 * 24 + 23) * 3600000 + 6 * 60000))
+
+    def test_only_all_time_uses_it(self):
+        stats_cache(self.stats, [("2026-07-01", 2, 5, 1200), ("2026-07-02", 1, 2, 600)])
+        windows = self.all_time()
+        self.assertEqual(windows["7d"]["sessions"], "1")
+        self.assertEqual(windows["30d"]["historyDays"], 0)
+
+    def test_a_missing_or_broken_stats_file_changes_nothing(self):
+        self.assertEqual(self.all_time()["all"]["sessions"], "1")
+        with open(self.stats, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertEqual(self.all_time()["all"]["sessions"], "1")
+
+    def test_every_profiles_file_is_read_whatever_launched_herdr(self):
+        # Herdr runs the helper without the shell's $CLAUDE_CONFIG_DIR, so the files can't hang on which profile is active.
+        home = os.path.join(self.dir, "home")
+        for name, days in ((".claude", [("2026-06-01", 3, 1, 90)]), (".claude-work", [("2026-07-01", 2, 5, 1200), ("2026-07-02", 1, 2, 600)])):
+            os.makedirs(os.path.join(home, name, "projects", "p"))
+            open(os.path.join(home, name, "projects", "p", "x.jsonl"), "w").close()
+            stats_cache(os.path.join(home, name, "stats-cache.json"), days)
+        os.makedirs(os.path.join(home, ".claude-work", "projects", "proj"))
+        self.write("c.jsonl", "c", "2026-07-02T09:30:00Z", "2026-07-02T09:40:00Z", root=os.path.join(home, ".claude-work", "projects"))
+        for env in ({}, {"CLAUDE_CONFIG_DIR": os.path.join(home, ".claude")}, {"CLAUDE_CONFIG_DIR": os.path.join(home, ".claude-work")}):
+            with mock.patch.dict(os.environ, {"HOME": home, **env}), mock.patch.dict(os.environ, {} if env else {"CLAUDE_CONFIG_DIR": ""}):
+                if not env:
+                    os.environ.pop("CLAUDE_CONFIG_DIR")
+                with mock.patch.object(helper, "today_of", return_value=date(2026, 7, 2)):
+                    view = helper.read(self.args(projects=None, stats=None, cache=os.path.join(self.dir, "c%d.json" % len(env))))["windows"]["all"]
+            self.assertEqual((view["sessions"], view["historyDays"]), ("6", 2), env)
+
+    def test_a_copied_file_adds_nothing(self):
+        day = {"days": {"2026-07-01": {"sessions": 2, "tools": 5, "tokens": 1200}}, "unplaced": 10, "longest": 7}
+        self.assertEqual(helper.merge_history([day, day, None]), day)
+
+
+class Backups(unittest.TestCase):
+    def test_backup_names_on_a_real_mac(self):
+        for name in (".claude copy", ".claude-copy", ".claude-BACKUP", ".claude-backup-20260212", ".claude.bak"):
+            self.assertTrue(helper.is_backup(name), name)
+        for name in (".claude", ".claude-work", ".claude-eval"):
+            self.assertFalse(helper.is_backup(name), name)
+
+    def roots(self, settings=None, active=".claude-work"):
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "runs-cache.json")
+            if settings is not None:
+                with open(os.path.join(d, "settings.json"), "w", encoding="utf-8") as f:
+                    f.write(settings)
+            found = [{"name": n, "dir": "/h/%s/projects" % n, "files": 1, "active": n == active}
+                     for n in (".claude-work", ".claude", ".claude copy", ".claude-BACKUP")]
+            with mock.patch.object(helper.wrapped, "discover_profiles", return_value=found):
+                return [os.path.basename(os.path.dirname(r)) for r in helper.roots_for(mock.Mock(projects=None, cache=cache))]
+
+    def test_backups_are_left_out_by_default(self):
+        self.assertEqual(self.roots(), [".claude-work", ".claude"])
+        self.assertEqual(self.roots("{broken"), [".claude-work", ".claude"])
+        self.assertEqual(self.roots('{"includeBackups": "yes"}'), [".claude-work", ".claude"])
+
+    def test_the_setting_brings_them_in(self):
+        self.assertEqual(self.roots('{"includeBackups": true}'), [".claude-work", ".claude", ".claude copy", ".claude-BACKUP"])
+
+    def test_the_active_profile_is_never_left_out(self):
+        self.assertIn(".claude copy", self.roots(active=".claude copy"))
+
+
+class Streamed(unittest.TestCase):
+    def test_a_reply_split_into_lines_counts_its_usage_per_line_like_stats(self):
+        # Claude Code writes one line per content block, and every line repeats the reply's whole usage. /stats adds them
+        # all up, and so does Wrapped, so the two agree. The tool call still counts once.
+        usage = {"input_tokens": 10, "output_tokens": 90, "cache_read_input_tokens": 900}
+        lines = [{"type": "assistant", "uuid": "u%d" % i, "requestId": "req1", "sessionId": "s", "timestamp": "2026-07-01T09:00:0%dZ" % i,
+                  "message": {"id": "msg1", "model": "claude-opus-4-8", "usage": usage, "content": [block]}}
+                 for i, block in enumerate([{"type": "thinking"}, {"type": "text", "text": "ok"},
+                                            {"type": "tool_use", "id": "t1", "name": "Bash"}])]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(json.dumps(x) for x in lines))
+            run = wrapped.parse_run(path)
+        self.assertEqual(run["tokens"], 3000)
+        self.assertEqual(run["tool_calls"], 1)
+
+
 class Demo(unittest.TestCase):
     def reply(self):
-        args = mock.Mock(demo=True, projects=None, cache=None, budget=15.0)
+        args = mock.Mock(demo=True, projects=None, stats=None, cache=None, budget=15.0)
         return helper.read(args)
 
     def test_believable_for_a_heavy_user(self):
@@ -349,12 +500,15 @@ class Demo(unittest.TestCase):
     def test_the_same_every_time(self):
         self.assertEqual(self.reply(), self.reply())
 
-    def test_this_month_is_the_samples_newest(self):
-        self.assertEqual(self.reply()["windows"]["month"]["window"], "2026-10")
+    def test_the_windows_end_on_the_samples_newest_day(self):
+        windows = self.reply()["windows"]
+        self.assertEqual(windows["7d"]["window"], "last 7 days")
+        self.assertFalse(windows["7d"]["empty"])
+        self.assertFalse(windows["30d"]["empty"])
 
     def test_the_card_says_it_is_sample_data(self):
         with tempfile.TemporaryDirectory() as out, mock.patch.object(helper.wrapped, "find_browser", return_value=None):
-            reply = helper.save(mock.Mock(demo=True, projects=None, cache=None, window="all", jar=False, out=out))
+            reply = helper.save(mock.Mock(demo=True, projects=None, stats=None, cache=None, window="all", jar=False, out=out))
             with open(reply["saved"], encoding="utf-8") as f:
                 self.assertIn("sample data", f.read())
 
