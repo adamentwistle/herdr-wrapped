@@ -371,12 +371,11 @@ class History(unittest.TestCase):
             return helper.read(self.args(stats=self.stats, **more))["windows"]
 
     def test_a_day_with_no_transcripts_comes_from_the_stats_file(self):
-        # 07-02 is in both, and /stats has it at twice the transcripts' tokens, so 07-01's 1200 count as 600.
         stats_cache(self.stats, [("2026-07-01", 2, 5, 1200), ("2026-07-02", 1, 2, 600)])
         view = self.all_time()["all"]
         self.assertEqual(view["sessions"], "3")
         self.assertEqual(view["toolCalls"], "7")
-        self.assertEqual((view["tokens"], view["unit"]), ("900", ""))
+        self.assertEqual((view["tokens"], view["unit"]), ("1.5", "K"))
         self.assertEqual(view["historyDays"], 1)
         self.assertEqual(view["strip"]["from"], "jul 1")
         self.assertEqual(view["busiest"]["label"], "jul 1")
@@ -392,12 +391,12 @@ class History(unittest.TestCase):
         view = self.all_time()["all"]
         self.assertEqual(view["sessions"], "4")
         self.assertEqual(view["toolCalls"], "8")
-        self.assertEqual((view["tokens"], view["unit"]), ("1.2", "K"))
+        self.assertEqual((view["tokens"], view["unit"]), ("2.1", "K"))
 
     def test_tokens_with_no_day_still_count_toward_all_time(self):
         stats_cache(self.stats, [("2026-07-01", 2, 5, 1200), ("2026-07-02", 1, 2, 600)], unplaced=200)
         view = self.all_time()["all"]
-        self.assertEqual((view["tokens"], view["unit"]), ("1.0", "K"))
+        self.assertEqual((view["tokens"], view["unit"]), ("1.7", "K"))
 
     def test_the_longest_session_can_come_from_the_stats_file(self):
         stats_cache(self.stats, [("2026-06-01", 1, 0, 0), ("2026-07-02", 1, 2, 600)], longest=(4 * 24 + 23) * 3600000 + 6 * 60000)
@@ -420,10 +419,40 @@ class History(unittest.TestCase):
             self.assertEqual(helper.stats_cache_path(), "/somewhere/.claude-work/stats-cache.json")
 
 
+class Backups(unittest.TestCase):
+    def test_backup_names_on_a_real_mac(self):
+        for name in (".claude copy", ".claude-copy", ".claude-BACKUP", ".claude-backup-20260212", ".claude.bak"):
+            self.assertTrue(helper.is_backup(name), name)
+        for name in (".claude", ".claude-work", ".claude-eval"):
+            self.assertFalse(helper.is_backup(name), name)
+
+    def roots(self, settings=None, active=".claude-work"):
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "runs-cache.json")
+            if settings is not None:
+                with open(os.path.join(d, "settings.json"), "w", encoding="utf-8") as f:
+                    f.write(settings)
+            found = [{"name": n, "dir": "/h/%s/projects" % n, "files": 1, "active": n == active}
+                     for n in (".claude-work", ".claude", ".claude copy", ".claude-BACKUP")]
+            with mock.patch.object(helper.wrapped, "discover_profiles", return_value=found):
+                return [os.path.basename(os.path.dirname(r)) for r in helper.roots_for(mock.Mock(projects=None, cache=cache))]
+
+    def test_backups_are_left_out_by_default(self):
+        self.assertEqual(self.roots(), [".claude-work", ".claude"])
+        self.assertEqual(self.roots("{broken"), [".claude-work", ".claude"])
+        self.assertEqual(self.roots('{"includeBackups": "yes"}'), [".claude-work", ".claude"])
+
+    def test_the_setting_brings_them_in(self):
+        self.assertEqual(self.roots('{"includeBackups": true}'), [".claude-work", ".claude", ".claude copy", ".claude-BACKUP"])
+
+    def test_the_active_profile_is_never_left_out(self):
+        self.assertIn(".claude copy", self.roots(active=".claude copy"))
+
+
 class Streamed(unittest.TestCase):
-    def test_a_reply_split_into_lines_counts_its_usage_once(self):
+    def test_a_reply_split_into_lines_counts_its_usage_per_line_like_stats(self):
         # Claude Code writes one line per content block, and every line repeats the reply's whole usage. /stats adds them
-        # all up. A reply is counted once here.
+        # all up, and so does Wrapped, so the two agree. The tool call still counts once.
         usage = {"input_tokens": 10, "output_tokens": 90, "cache_read_input_tokens": 900}
         lines = [{"type": "assistant", "uuid": "u%d" % i, "requestId": "req1", "sessionId": "s", "timestamp": "2026-07-01T09:00:0%dZ" % i,
                   "message": {"id": "msg1", "model": "claude-opus-4-8", "usage": usage, "content": [block]}}
@@ -434,7 +463,7 @@ class Streamed(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(json.dumps(x) for x in lines))
             run = wrapped.parse_run(path)
-        self.assertEqual(run["tokens"], 1000)
+        self.assertEqual(run["tokens"], 3000)
         self.assertEqual(run["tool_calls"], 1)
 
 

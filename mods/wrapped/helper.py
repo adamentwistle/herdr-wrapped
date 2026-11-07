@@ -120,10 +120,8 @@ def history_of(runs, history):
     """What the stats cache adds to these runs: for each day where it knows of more sessions than the transcripts do,
     because Claude Code has deleted them, its day replaces theirs. Returns None when it adds nothing.
 
-    Claude Code writes one transcript line per content block of a reply, and each line repeats the whole reply's usage.
-    wrapped.py counts a reply once. /stats adds up every line, so its tokens run about twice as high. Its day totals are
-    scaled by what the transcripts give on the days both have in full, so the two sources agree on what a token is. Cost
-    and the cache share follow the transcripts' own rates."""
+    Tokens are counted /stats' way on both sides: a reply's usage once per streamed line. Cost and the cache share for
+    the filled days follow the transcripts' own rates."""
     if not history:
         return None
     by_day = {}
@@ -133,12 +131,7 @@ def history_of(runs, history):
             d["sessions"].add(r["run_id"])
         d["tokens"] += r["tokens"]
         d["tools"] += r["tool_calls"]
-    ours = theirs = 0
-    for day, h in history["days"].items():
-        mine = by_day.get(day)
-        if mine and h["tokens"] and len(mine["sessions"]) == h["sessions"]:
-            ours, theirs = ours + mine["tokens"], theirs + h["tokens"]
-    scale = ours / theirs if theirs else 1.0
+    scale = 1.0
     added = {"sessions": 0, "tokens": 0, "tools": 0, "days": {}}
     for day, h in history["days"].items():
         mine = by_day.get(day) or {"sessions": (), "tokens": 0, "tools": 0}
@@ -273,10 +266,33 @@ def view_of(runs, window, made_up=False, history=None):
     }
 
 
+BACKUP_WORDS = ("copy", "backup", "bak")
+
+
+def is_backup(name):
+    """A copied Claude folder, by its name: ".claude copy", ".claude-copy", ".claude-BACKUP", ".claude-backup-20260212".
+    Real profiles are named for what they're for, like ".claude-work" or ".claude-eval"."""
+    return any(word in name.lower() for word in BACKUP_WORDS)
+
+
+def settings_of(cache_path):
+    """settings.json beside the cache, in Herdr's data folder: {"includeBackups": true} reads backup copies too."""
+    if not cache_path:
+        return {}
+    try:
+        with open(os.path.join(os.path.dirname(cache_path), "settings.json"), encoding="utf-8") as f:
+            found = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
 def roots_for(args):
     if args.projects:
         return args.projects
-    return [p["dir"] for p in wrapped.discover_profiles() if p["files"]]
+    backups = settings_of(args.cache).get("includeBackups") is True
+    return [p["dir"] for p in wrapped.discover_profiles()
+            if p["files"] and (backups or p["active"] or not is_backup(p["name"]))]
 
 
 def transcripts(roots):
